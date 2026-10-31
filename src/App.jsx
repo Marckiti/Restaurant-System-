@@ -1,39 +1,49 @@
-﻿import { memo, useCallback, useEffect, useMemo, useRef, useState } from 'react'
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import { createClient } from '@supabase/supabase-js'
-import { ChefHat, Clock3, CreditCard, LogOut, ShieldCheck, Sparkles, Users } from 'lucide-react'
+import { io } from 'socket.io-client'
 import {
-  COOKING_MODES,
+  Users,
+  ChefHat,
+  ShieldCheck,
+  LogOut,
+  Fish,
+  Share2,
+} from 'lucide-react'
+import {
   DEFAULT_BASE_PRICES,
-  PRODUCT_CATALOG,
   PRODUCT_MAP,
-  QUICK_ITEMS,
   buildDefaultState,
   buildInitialTables,
-  calculateDailySummary,
   createOrder,
-  formatCurrency,
   getProductPrice,
-  getStatusStyles,
-  getTableStatus,
   getTodayLabel,
-  sumOrder,
 } from './logic.js'
 
-const STORAGE_KEY = 'ginita-pos-v1'
+import TableCard from './components/TableCard.jsx'
+import TableOrderDrawer from './components/TableOrderDrawer.jsx'
+import FishCookingModal from './components/FishCookingModal.jsx'
+import PortionModal from './components/PortionModal.jsx'
+import EmpanadaModal from './components/EmpanadaModal.jsx'
+import AlmejasModal from './components/AlmejasModal.jsx'
+import PaymentModal from './components/PaymentModal.jsx'
+import BottomNavBar from './components/BottomNavBar.jsx'
+import KitchenView from './components/KitchenView.jsx'
+import ReportView from './components/ReportView.jsx'
+import AdminPricesView from './components/AdminPricesView.jsx'
+import RoleSelector from './components/RoleSelector.jsx'
+import ConnectDevicesModal from './components/ConnectDevicesModal.jsx'
+
+const STORAGE_KEY = 'ginita-pos-v3'
 const CHANNEL_KEY = 'ginita-pos-sync'
 const SHARED_STATE_ID = 'ginita-pos-shared'
-const SUPABASE_URL = import.meta.env.NEXT_PUBLIC_SUPABASE_URL || import.meta.env.VITE_SUPABASE_URL
-const SUPABASE_ANON_KEY = import.meta.env.NEXT_PUBLIC_SUPABASE_PUBLISHABLE_KEY || import.meta.env.VITE_SUPABASE_ANON_KEY
-
-const USER_OPTIONS = [
-  { id: 'cashier', label: 'Cajero / Mesero', icon: Users },
-  { id: 'cook', label: 'Cocinero', icon: ChefHat },
-  { id: 'admin', label: 'Administrador', icon: ShieldCheck },
-]
+const SUPABASE_URL =
+  import.meta.env.NEXT_PUBLIC_SUPABASE_URL || import.meta.env.VITE_SUPABASE_URL
+const SUPABASE_ANON_KEY =
+  import.meta.env.NEXT_PUBLIC_SUPABASE_PUBLISHABLE_KEY ||
+  import.meta.env.VITE_SUPABASE_ANON_KEY
 
 const getSupabaseClient = () => {
   if (!SUPABASE_URL || !SUPABASE_ANON_KEY) return null
-
   return createClient(SUPABASE_URL, SUPABASE_ANON_KEY, {
     auth: {
       persistSession: false,
@@ -44,19 +54,17 @@ const getSupabaseClient = () => {
 
 const safeStorageRead = () => {
   if (typeof window === 'undefined') return null
-
   try {
     const raw = window.localStorage.getItem(STORAGE_KEY)
     return raw ? JSON.parse(raw) : null
   } catch (error) {
-    console.error('No se pudo leer persistencia local:', error)
+    console.error('Error al leer persistencia local:', error)
     return null
   }
 }
 
 const normalizeSharedState = (incoming) => {
   if (!incoming || typeof incoming !== 'object') return null
-
   return {
     tables: Array.isArray(incoming.tables) ? incoming.tables : [],
     dailySales: Array.isArray(incoming.dailySales) ? incoming.dailySales : [],
@@ -64,31 +72,9 @@ const normalizeSharedState = (incoming) => {
   }
 }
 
-const TableButton = memo(function TableButton({ table, status, isActive, onClick }) {
-  return (
-    <button
-      type="button"
-      onClick={onClick}
-      className={`rounded-2xl border p-3 text-left shadow-sm transition active:scale-[0.99] ${
-        isActive ? 'border-slate-900 ring-2 ring-slate-900' : 'border-slate-200 hover:border-slate-300'
-      } ${getStatusStyles(status)}`}
-    >
-      <div className="mb-2 flex items-center justify-between gap-2 text-[9px] font-bold uppercase tracking-[0.12em]">
-        <span>{table.type}</span>
-        <span>{status === 'free' ? 'Disponible' : status === 'occupied' ? 'Ocupada' : 'Cobro'}</span>
-      </div>
-      <div className="text-2xl font-black">{table.id}</div>
-      <div className="mt-2 text-xs font-semibold opacity-90">
-        {table.order ? `${table.order.items.length} ítems` : 'Sin pedido'}
-      </div>
-    </button>
-  )
-})
-
-function App() {
+export default function App() {
   const [state, setState] = useState(() => {
     const stored = safeStorageRead()
-
     if (stored) {
       return {
         ...buildDefaultState(),
@@ -97,48 +83,114 @@ function App() {
         basePrices: { ...DEFAULT_BASE_PRICES, ...(stored.basePrices || {}) },
         dailySales: stored.dailySales || [],
         userRole: stored.userRole || null,
+        currentView: stored.currentView || 'tables',
       }
     }
-
     return buildDefaultState()
   })
 
   const syncChannelRef = useRef(null)
   const remoteSyncRef = useRef(false)
-  const [selectedCooking, setSelectedCooking] = useState('frito')
-  const [paymentSelection, setPaymentSelection] = useState({ open: false, tableId: null, total: 0, method: null })
-  const [showProductPicker, setShowProductPicker] = useState(false)
+  const socketRef = useRef(null)
+  const lastUpdateRef = useRef(0)
+  const [dbStatus, setDbStatus] = useState(null)
 
+  // Floating Modals state
+  const [fishCookingSelection, setFishCookingSelection] = useState({
+    isOpen: false,
+    product: null,
+  })
+  const [portionModalOpen, setPortionModalOpen] = useState(false)
+  const [empanadaModalOpen, setEmpanadaModalOpen] = useState(false)
+  const [almejasModalOpen, setAlmejasModalOpen] = useState(false)
+  const [connectModalOpen, setConnectModalOpen] = useState(false)
+
+  const [paymentSelection, setPaymentSelection] = useState({
+    isOpen: false,
+    tableId: null,
+    total: 0,
+  })
+  const [tableFilter, setTableFilter] = useState('all')
+
+  // Apply state from external sync (socket, http poll, or broadcast channel)
   const applyIncomingState = useCallback((incoming) => {
     const normalized = normalizeSharedState(incoming)
     if (!normalized) return
 
+    if (incoming.updatedAt && incoming.updatedAt <= lastUpdateRef.current) {
+      return
+    }
+    if (incoming.updatedAt) {
+      lastUpdateRef.current = incoming.updatedAt
+    }
+
     remoteSyncRef.current = true
-
-    setState((prev) => {
-      const next = {
-        ...buildDefaultState(),
-        ...prev,
-        tables: normalized.tables,
-        dailySales: normalized.dailySales,
-        basePrices: { ...DEFAULT_BASE_PRICES, ...normalized.basePrices },
-      }
-
-      return next
-    })
+    setState((prev) => ({
+      ...prev,
+      tables: normalized.tables,
+      dailySales: normalized.dailySales,
+      basePrices: { ...DEFAULT_BASE_PRICES, ...normalized.basePrices },
+    }))
   }, [])
 
+  // Sync listener setup across all channels
   useEffect(() => {
     if (typeof window === 'undefined') return undefined
 
-    const channel = 'BroadcastChannel' in window ? new BroadcastChannel(CHANNEL_KEY) : null
+    const channel =
+      'BroadcastChannel' in window ? new BroadcastChannel(CHANNEL_KEY) : null
     syncChannelRef.current = channel
 
-    const client = getSupabaseClient()
+    // 1. Initial HTTP fetch from MongoDB / server
+    fetch('/api/state')
+      .then((res) => (res.ok ? res.json() : null))
+      .then((data) => {
+        if (data) applyIncomingState(data)
+      })
+      .catch(() => {})
 
+    fetch('/api/status')
+      .then((res) => (res.ok ? res.json() : null))
+      .then((status) => {
+        if (status) setDbStatus(status)
+      })
+      .catch(() => {})
+
+    // 2. Real-time Socket.io for instantaneous multi-device updates
+    let socket = null
+    try {
+      socket = io({ transports: ['websocket', 'polling'], timeout: 4000 })
+      socketRef.current = socket
+      socket.on('state:update', (incoming) => {
+        if (incoming) applyIncomingState(incoming)
+      })
+    } catch {
+      // fallback to HTTP polling
+    }
+
+    // 3. Periodic polling interval (every 2.5s) to guarantee multi-device consistency
+    const pollInterval = setInterval(() => {
+      fetch('/api/state')
+        .then((res) => (res.ok ? res.json() : null))
+        .then((data) => {
+          if (data) applyIncomingState(data)
+        })
+        .catch(() => {})
+    }, 2500)
+
+    const statusInterval = setInterval(() => {
+      fetch('/api/status')
+        .then((res) => (res.ok ? res.json() : null))
+        .then((status) => {
+          if (status) setDbStatus(status)
+        })
+        .catch(() => {})
+    }, 12000)
+
+    // 4. Supabase fallback if configured
+    const client = getSupabaseClient()
     const syncFromSupabase = async () => {
       if (!client) return
-
       const { data, error } = await client
         .from('pos_state')
         .select('payload')
@@ -167,7 +219,9 @@ function App() {
         )
         .subscribe()
 
-      return () => { supabaseChannel.unsubscribe() }
+      return () => {
+        supabaseChannel.unsubscribe()
+      }
     }
 
     const cleanupSupabase = syncFromSupabase()
@@ -185,7 +239,7 @@ function App() {
         try {
           applyIncomingState(JSON.parse(event.newValue))
         } catch (error) {
-          console.error('No se pudo sincronizar el estado:', error)
+          console.error('Error al sincronizar con almacenamiento:', error)
         }
       }
     }
@@ -194,25 +248,38 @@ function App() {
 
     return () => {
       if (channel) channel.close()
+      if (socket) socket.disconnect()
+      socketRef.current = null
+      clearInterval(pollInterval)
+      clearInterval(statusInterval)
       cleanupSupabase?.then((cleanup) => cleanup && cleanup())
       syncChannelRef.current = null
       window.removeEventListener('storage', handleStorage)
     }
   }, [applyIncomingState])
 
+  // Sync state outbound to local storage, broadcast channel, Socket.io, and backend DB API
   useEffect(() => {
     if (typeof window === 'undefined') return
 
+    const now = Date.now()
     const sharedState = {
       tables: state.tables,
       dailySales: state.dailySales,
       basePrices: state.basePrices,
+      updatedAt: now,
     }
 
-    window.localStorage.setItem(STORAGE_KEY, JSON.stringify({ ...state, ...sharedState }))
+    window.localStorage.setItem(
+      STORAGE_KEY,
+      JSON.stringify({ ...state, ...sharedState }),
+    )
 
     if (syncChannelRef.current) {
-      syncChannelRef.current.postMessage({ type: 'GINITA_POS_SYNC', state: sharedState })
+      syncChannelRef.current.postMessage({
+        type: 'GINITA_POS_SYNC',
+        state: sharedState,
+      })
     }
 
     if (remoteSyncRef.current) {
@@ -220,6 +287,21 @@ function App() {
       return
     }
 
+    lastUpdateRef.current = now
+
+    // 1. Broadcast via Socket.io
+    if (socketRef.current?.connected) {
+      socketRef.current.emit('state:update', sharedState)
+    }
+
+    // 2. Save to Node backend and MongoDB Atlas
+    fetch('/api/state', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(sharedState),
+    }).catch(() => {})
+
+    // 3. Optional Supabase sync
     const client = getSupabaseClient()
     if (client) {
       client
@@ -237,20 +319,16 @@ function App() {
     }
   }, [state])
 
+  // Computed data
   const selectedTable = useMemo(
-    () => state.tables.find((table) => table.id === state.selectedTableId) || null,
+    () => state.tables.find((t) => t.id === state.selectedTableId) || null,
     [state.tables, state.selectedTableId],
-  )
-
-  const productPrices = useMemo(
-    () => Object.fromEntries(PRODUCT_CATALOG.map((product) => [product.id, getProductPrice(product.id, state.basePrices)])),
-    [state.basePrices],
   )
 
   const kitchenQueue = useMemo(
     () =>
       state.tables
-        .filter((table) => table.order && table.order.sentToKitchen)
+        .filter((table) => table.order && table.order.sentToKitchen && !table.order.paid)
         .map((table) => ({
           tableId: table.id,
           order: table.order,
@@ -260,42 +338,113 @@ function App() {
     [state.tables],
   )
 
-  const reportBreakdown = useMemo(() => calculateDailySummary(state.dailySales), [state.dailySales])
-  const todaysRevenue = reportBreakdown.total
+  // Filtered tables for the grid
+  const filteredTables = useMemo(() => {
+    if (tableFilter === 'interior') {
+      return state.tables.filter((t) => t.type === 'Interior')
+    }
+    if (tableFilter === 'exterior') {
+      return state.tables.filter((t) => t.type === 'Exterior')
+    }
+    if (tableFilter === 'occupied') {
+      return state.tables.filter(
+        (t) => t.order && Array.isArray(t.order.items) && t.order.items.length > 0,
+      )
+    }
+    return state.tables
+  }, [state.tables, tableFilter])
 
-  const openTable = useCallback((tableId) => {
+  // Table action handlers
+  const handleOpenTable = useCallback((tableId) => {
     setState((prev) => ({
       ...prev,
       selectedTableId: tableId,
-      currentView: 'tables',
-      tables: prev.tables.map((table) => {
-        if (table.id !== tableId) return table
-        return table.order ? table : { ...table, order: createOrder() }
+      tables: prev.tables.map((t) => {
+        if (t.id !== tableId) return t
+        return t.order ? t : { ...t, order: createOrder() }
       }),
     }))
   }, [])
 
-  const updateSelectedTable = useCallback((updater) => {
+  const handleCloseDrawer = useCallback(() => {
+    setState((prev) => ({
+      ...prev,
+      selectedTableId: null,
+      tables: prev.tables.map((t) => {
+        // If table order has 0 items, clean it up completely so it's not occupied
+        if (
+          t.id === prev.selectedTableId &&
+          t.order &&
+          (!Array.isArray(t.order.items) || t.order.items.length === 0)
+        ) {
+          return { ...t, order: null }
+        }
+        return t
+      }),
+    }))
+  }, [])
+
+  // Adding product directly (non-cooking items like beverages or morocho)
+  const handleAddProduct = useCallback((productId, customQty = 1) => {
     setState((prev) => {
       if (!prev.selectedTableId) return prev
+      const product = PRODUCT_MAP[productId]
+      if (!product) return prev
 
       return {
         ...prev,
         tables: prev.tables.map((table) => {
           if (table.id !== prev.selectedTableId) return table
-          return updater(table)
+
+          const order = table.order || createOrder()
+          const key = productId
+          const nextItems = [...order.items]
+          const existingIndex = nextItems.findIndex((item) => item.key === key)
+          const unitPrice = getProductPrice(productId, prev.basePrices)
+
+          if (existingIndex >= 0) {
+            nextItems[existingIndex] = {
+              ...nextItems[existingIndex],
+              qty: Number(nextItems[existingIndex].qty || 0) + customQty,
+              unitPrice,
+            }
+          } else {
+            nextItems.push({
+              key,
+              productId,
+              name: product.name,
+              qty: customQty,
+              unitPrice,
+              category: product.category,
+              cooking: null,
+              serviceType: 'servir',
+              takeoutExtra: 0,
+              notes: null,
+            })
+          }
+
+          return {
+            ...table,
+            order: {
+              ...order,
+              items: nextItems,
+            },
+          }
         }),
       }
     })
   }, [])
 
-  const addProductToOrder = useCallback(
-    (productId, customQty = 1) => {
+  // 1. Confirming Fish with cooking mode, takeout (+$0.25), and kitchen notes
+  const handleConfirmCooking = useCallback(
+    ({ cookingMode, serviceType, takeoutExtra, unitPrice, notes, qty }) => {
+      if (!fishCookingSelection.product) return
+
+      const product = fishCookingSelection.product
+      const productId = product.id
+
       setState((prev) => {
         if (!prev.selectedTableId) return prev
-
-        const product = PRODUCT_MAP[productId]
-        if (!product) return prev
 
         return {
           ...prev,
@@ -303,15 +452,14 @@ function App() {
             if (table.id !== prev.selectedTableId) return table
 
             const order = table.order || createOrder()
-            const key = product.requiresCooking ? `${productId}:${selectedCooking}` : productId
+            const key = `${productId}:${cookingMode}:${serviceType}:${notes || 'std'}`
             const nextItems = [...order.items]
             const existingIndex = nextItems.findIndex((item) => item.key === key)
-            const unitPrice = getProductPrice(productId, prev.basePrices)
 
             if (existingIndex >= 0) {
               nextItems[existingIndex] = {
                 ...nextItems[existingIndex],
-                qty: Number(nextItems[existingIndex].qty || 0) + customQty,
+                qty: Number(nextItems[existingIndex].qty || 0) + qty,
                 unitPrice,
               }
             } else {
@@ -319,10 +467,13 @@ function App() {
                 key,
                 productId,
                 name: product.name,
-                qty: customQty,
+                qty,
                 unitPrice,
                 category: product.category,
-                cooking: product.requiresCooking ? selectedCooking : null,
+                cooking: cookingMode,
+                serviceType,
+                takeoutExtra,
+                notes,
               })
             }
 
@@ -331,94 +482,275 @@ function App() {
               order: {
                 ...order,
                 items: nextItems,
-                sentToKitchen: false,
-                pendingPayment: false,
-                paid: false,
               },
             }
           }),
         }
       })
+
+      setFishCookingSelection({ isOpen: false, product: null })
     },
-    [selectedCooking],
+    [fishCookingSelection.product],
   )
 
-  const updateItemQty = useCallback(
-    (productKey, delta) => {
-      updateSelectedTable((table) => {
-        if (!table.order) return table
-
-        const items = table.order.items
-          .map((item) => {
-            if (item.key !== productKey) return item
-            const nextQty = Number(item.qty || 0) + delta
-            if (nextQty <= 0) return null
-            return { ...item, qty: nextQty }
-          })
-          .filter(Boolean)
+  // 2. Confirming Portion (Papa, Tostado, Curtido)
+  const handleConfirmPortion = useCallback(
+    ({ portionId, name, unitPrice, serviceType, qty }) => {
+      setState((prev) => {
+        if (!prev.selectedTableId) return prev
 
         return {
-          ...table,
-          order: {
-            ...table.order,
-            items,
-            sentToKitchen: false,
-            pendingPayment: false,
-            paid: false,
-          },
+          ...prev,
+          tables: prev.tables.map((table) => {
+            if (table.id !== prev.selectedTableId) return table
+
+            const order = table.order || createOrder()
+            const key = `${portionId}:${serviceType}`
+            const nextItems = [...order.items]
+            const existingIndex = nextItems.findIndex((item) => item.key === key)
+
+            if (existingIndex >= 0) {
+              nextItems[existingIndex] = {
+                ...nextItems[existingIndex],
+                qty: Number(nextItems[existingIndex].qty || 0) + qty,
+                unitPrice,
+              }
+            } else {
+              nextItems.push({
+                key,
+                productId: portionId,
+                name,
+                qty,
+                unitPrice,
+                category: 'Pescados',
+                cooking: null,
+                serviceType,
+                takeoutExtra: 0,
+                notes: null,
+              })
+            }
+
+            return {
+              ...table,
+              order: {
+                ...order,
+                items: nextItems,
+              },
+            }
+          }),
         }
       })
+
+      setPortionModalOpen(false)
     },
-    [updateSelectedTable],
+    [],
   )
 
-  const removeItem = useCallback(
-    (productKey) => {
-      updateSelectedTable((table) => {
-        if (!table.order) return table
+  // 3. Confirming Empanadas fast quantity
+  const handleConfirmEmpanada = useCallback(
+    ({ qty, unitPrice, serviceType }) => {
+      setState((prev) => {
+        if (!prev.selectedTableId) return prev
+
         return {
-          ...table,
-          order: {
-            ...table.order,
-            items: table.order.items.filter((item) => item.key !== productKey),
-            sentToKitchen: false,
-            pendingPayment: false,
-            paid: false,
-          },
+          ...prev,
+          tables: prev.tables.map((table) => {
+            if (table.id !== prev.selectedTableId) return table
+
+            const order = table.order || createOrder()
+            const key = `empanada:${serviceType}`
+            const nextItems = [...order.items]
+            const existingIndex = nextItems.findIndex((item) => item.key === key)
+
+            if (existingIndex >= 0) {
+              nextItems[existingIndex] = {
+                ...nextItems[existingIndex],
+                qty: Number(nextItems[existingIndex].qty || 0) + qty,
+                unitPrice,
+              }
+            } else {
+              nextItems.push({
+                key,
+                productId: 'empanada',
+                name: 'Empanadas',
+                qty,
+                unitPrice,
+                category: 'Empanadas',
+                cooking: null,
+                serviceType,
+                takeoutExtra: 0,
+                notes: null,
+              })
+            }
+
+            return {
+              ...table,
+              order: {
+                ...order,
+                items: nextItems,
+              },
+            }
+          }),
         }
       })
+
+      setEmpanadaModalOpen(false)
     },
-    [updateSelectedTable],
+    [],
   )
 
-  const sendToKitchen = useCallback(() => {
-    updateSelectedTable((table) => {
-      if (!table.order || !table.order.items.length) return table
+  // 4. Confirming Almejas with takeout option
+  const handleConfirmAlmejas = useCallback(
+    ({ qty, unitPrice, serviceType, notes }) => {
+      setState((prev) => {
+        if (!prev.selectedTableId) return prev
+
+        return {
+          ...prev,
+          tables: prev.tables.map((table) => {
+            if (table.id !== prev.selectedTableId) return table
+
+            const order = table.order || createOrder()
+            const key = `almejas:${serviceType}:${notes || 'std'}`
+            const nextItems = [...order.items]
+            const existingIndex = nextItems.findIndex((item) => item.key === key)
+
+            if (existingIndex >= 0) {
+              nextItems[existingIndex] = {
+                ...nextItems[existingIndex],
+                qty: Number(nextItems[existingIndex].qty || 0) + qty,
+                unitPrice,
+              }
+            } else {
+              nextItems.push({
+                key,
+                productId: 'almejas',
+                name: 'Almejas',
+                qty,
+                unitPrice,
+                category: 'Pescados',
+                cooking: null,
+                serviceType,
+                takeoutExtra: 0,
+                notes,
+              })
+            }
+
+            return {
+              ...table,
+              order: {
+                ...order,
+                items: nextItems,
+              },
+            }
+          }),
+        }
+      })
+
+      setAlmejasModalOpen(false)
+    },
+    [],
+  )
+
+  // Updating quantity of item in order
+  const handleUpdateQty = useCallback((itemKey, delta) => {
+    setState((prev) => {
+      if (!prev.selectedTableId) return prev
+
       return {
-        ...table,
-        order: {
-          ...table.order,
-          sentToKitchen: true,
-          pendingPayment: false,
-          paid: false,
-          arrivedAt: table.order.arrivedAt || Date.now(),
-        },
+        ...prev,
+        tables: prev.tables.map((table) => {
+          if (table.id !== prev.selectedTableId || !table.order) return table
+
+          const items = table.order.items
+            .map((item) => {
+              if (item.key !== itemKey) return item
+              const nextQty = Number(item.qty || 0) + delta
+              return nextQty <= 0 ? null : { ...item, qty: nextQty }
+            })
+            .filter(Boolean)
+
+          return {
+            ...table,
+            order: {
+              ...table.order,
+              items,
+            },
+          }
+        }),
       }
     })
-  }, [updateSelectedTable])
+  }, [])
 
-  const completeKitchenOrder = useCallback((tableId) => {
+  // Removing an item from the order
+  const handleRemoveItem = useCallback((itemKey) => {
+    setState((prev) => {
+      if (!prev.selectedTableId) return prev
+
+      return {
+        ...prev,
+        tables: prev.tables.map((table) => {
+          if (table.id !== prev.selectedTableId || !table.order) return table
+
+          return {
+            ...table,
+            order: {
+              ...table.order,
+              items: table.order.items.filter((item) => item.key !== itemKey),
+            },
+          }
+        }),
+      }
+    })
+  }, [])
+
+  // Send table order to kitchen
+  const handleSendToKitchen = useCallback(() => {
+    setState((prev) => {
+      if (!prev.selectedTableId) return prev
+
+      return {
+        ...prev,
+        tables: prev.tables.map((table) => {
+          if (table.id !== prev.selectedTableId || !table.order) return table
+
+          // Mark all items as sent
+          const updatedItems = (table.order.items || []).map((item) => ({
+            ...item,
+            sent: true,
+          }))
+
+          return {
+            ...table,
+            order: {
+              ...table.order,
+              items: updatedItems,
+              sentToKitchen: true,
+              hasBeenSent: true,
+              kitchenDispatched: false,
+              pendingPayment: false,
+              paid: false,
+              arrivedAt: table.order.arrivedAt || Date.now(),
+            },
+          }
+        }),
+        selectedTableId: null,
+      }
+    })
+  }, [])
+
+  // Kitchen marks order dispatched
+  const handleCompleteKitchenOrder = useCallback((tableId) => {
     setState((prev) => ({
       ...prev,
       tables: prev.tables.map((table) => {
-        if (table.id !== tableId) return table
-        if (!table.order) return table
-
+        if (table.id !== tableId || !table.order) return table
         return {
           ...table,
           order: {
             ...table.order,
             sentToKitchen: false,
+            kitchenDispatched: true,
             pendingPayment: true,
             paid: false,
           },
@@ -427,61 +759,86 @@ function App() {
     }))
   }, [])
 
-  const finalizePayment = useCallback((tableId, paymentMethod) => {
-    setState((prev) => {
-      const table = prev.tables.find((item) => item.id === tableId)
-      if (!table?.order) return prev
+  // Open payment modal
+  const handleOpenPayment = useCallback(
+    (tableId) => {
+      const table = state.tables.find((t) => t.id === tableId)
+      if (!table?.order) return
 
-      const total = sumOrder(table.order)
-      const saleEntry = {
-        id: `venta-${Date.now()}`,
+      const total = table.order.items.reduce(
+        (sum, item) => sum + Number(item.unitPrice) * Number(item.qty),
+        0,
+      )
+
+      setPaymentSelection({
+        isOpen: true,
         tableId,
         total,
-        paymentMethod,
-        createdAt: Date.now(),
-        items: table.order.items.map((item) => ({ ...item })),
-      }
+      })
+    },
+    [state.tables],
+  )
 
-      return {
-        ...prev,
-        tables: prev.tables.map((item) => {
-          if (item.id !== tableId) return item
-          return {
-            ...item,
-            order: {
-              ...item.order,
-              pendingPayment: true,
-              paid: true,
-              sentToKitchen: false,
-            },
-          }
-        }),
-        dailySales: [...prev.dailySales, saleEntry],
-        selectedTableId: tableId,
-      }
-    })
-  }, [])
+  // Confirm payment
+  const handleConfirmPayment = useCallback(
+    (paymentMethod) => {
+      const tableId = paymentSelection.tableId
+      if (!tableId) return
 
-  const releaseTable = useCallback((tableId) => {
+      setState((prev) => {
+        const table = prev.tables.find((t) => t.id === tableId)
+        if (!table?.order) return prev
+
+        const total = table.order.items.reduce(
+          (sum, item) => sum + Number(item.unitPrice) * Number(item.qty),
+          0,
+        )
+
+        const saleEntry = {
+          id: `venta-${Date.now()}`,
+          tableId,
+          total,
+          paymentMethod,
+          createdAt: Date.now(),
+          items: table.order.items.map((i) => ({ ...i })),
+        }
+
+        return {
+          ...prev,
+          tables: prev.tables.map((t) => {
+            if (t.id !== tableId) return t
+            return {
+              ...t,
+              order: {
+                ...t.order,
+                pendingPayment: false,
+                paid: true,
+                sentToKitchen: false,
+              },
+            }
+          }),
+          dailySales: [...prev.dailySales, saleEntry],
+          selectedTableId: null,
+        }
+      })
+    },
+    [paymentSelection.tableId],
+  )
+
+  // Release/vacate table
+  const handleReleaseTable = useCallback((tableId) => {
     setState((prev) => ({
       ...prev,
-      tables: prev.tables.map((table) => {
-        if (table.id !== tableId) return table
-        return { ...table, order: null }
+      tables: prev.tables.map((t) => {
+        if (t.id !== tableId) return t
+        return { ...t, order: null }
       }),
       selectedTableId: null,
     }))
   }, [])
 
-  const setRole = useCallback((role) => {
-    setState((prev) => ({
-      ...prev,
-      userRole: role,
-      currentView: role === 'cook' ? 'kitchen' : 'tables',
-    }))
-  }, [])
-
-  const resetDay = useCallback(() => {
+  // Reset daily sales
+  const handleResetDay = useCallback(() => {
     setState((prev) => ({
       ...prev,
       dailySales: [],
@@ -489,547 +846,283 @@ function App() {
     }))
   }, [])
 
-  const currentOrderTotal = useMemo(
-    () => (selectedTable?.order ? sumOrder(selectedTable.order) : 0),
-    [selectedTable],
-  )
-
-  const closePayment = useCallback(() => {
-    setPaymentSelection({ open: false, tableId: null, total: 0, method: null })
+  // Admin updates base price
+  const handleUpdatePrice = useCallback((productId, newPrice) => {
+    setState((prev) => ({
+      ...prev,
+      basePrices: {
+        ...prev.basePrices,
+        [productId]: newPrice,
+      },
+    }))
   }, [])
 
-  const openPayment = useCallback(
-    (tableId) => {
-      setPaymentSelection({ open: true, tableId, total: currentOrderTotal, method: null })
-    },
-    [currentOrderTotal],
-  )
+  // Role selection
+  const handleSelectRole = useCallback((role) => {
+    setState((prev) => ({
+      ...prev,
+      userRole: role,
+      currentView: role === 'cook' ? 'kitchen' : 'tables',
+    }))
+  }, [])
 
   if (!state.userRole) {
     return (
-      <div className="flex min-h-screen items-center justify-center bg-slate-950 px-4">
-        <div className="w-full max-w-4xl rounded-3xl border border-slate-700 bg-slate-900 p-6 shadow-2xl shadow-slate-950/50 md:p-10">
-          <div className="mb-8 text-center">
-            <div className="mb-4 inline-flex items-center gap-3 rounded-full border border-cyan-500/40 bg-cyan-500/10 px-4 py-2 text-cyan-200">
-              <Sparkles size={18} />
-              <span className="text-sm font-semibold uppercase tracking-[0.2em]">Sistema POS</span>
-            </div>
-            <h1 className="text-3xl font-black text-white md:text-5xl">Ginita Restaurante</h1>
-            <p className="mt-3 text-slate-300">Selecciona el perfil para continuar.</p>
-          </div>
-
-          <div className="grid gap-5 md:grid-cols-3">
-            {USER_OPTIONS.map(({ id, label, icon: Icon }) => (
-              <button
-                key={id}
-                type="button"
-                onClick={() => setRole(id)}
-                className="group rounded-2xl border border-slate-700 bg-slate-800 p-5 text-left transition active:scale-[0.98] hover:border-cyan-400 hover:bg-slate-700"
-              >
-                <div className="mb-4 inline-flex rounded-xl bg-cyan-500/15 p-3 text-cyan-300">
-                  <Icon size={28} />
-                </div>
-                <h2 className="text-xl font-bold text-white">{label}</h2>
-                <p className="mt-2 text-sm text-slate-300">
-                  {id === 'cashier'
-                    ? 'Tomar pedidos, cobrar y gestionar mesas.'
-                    : id === 'cook'
-                      ? 'Ver órdenes activas por prioridad.'
-                      : 'Configurar productos y precios.'}
-                </p>
-              </button>
-            ))}
-          </div>
-        </div>
-      </div>
+      <>
+        <RoleSelector
+          onSelectRole={handleSelectRole}
+          onOpenConnect={() => setConnectModalOpen(true)}
+        />
+        <ConnectDevicesModal
+          isOpen={connectModalOpen}
+          onClose={() => setConnectModalOpen(false)}
+          dbStatus={dbStatus}
+        />
+      </>
     )
   }
 
-  const showAdminPanel = state.userRole === 'admin' && state.currentView === 'admin'
-  const showKitchenView = state.userRole === 'cook' || state.currentView === 'kitchen'
-
   return (
-    <div className="min-h-screen bg-slate-100 text-slate-900">
-      <header className="border-b border-slate-200 bg-white/90 backdrop-blur-sm">
-        <div className="mx-auto flex max-w-7xl flex-col gap-3 px-3 py-4 sm:px-4">
-          <div className="flex items-center justify-between gap-3">
-            <div>
-              <p className="text-[10px] font-semibold uppercase tracking-[0.25em] text-slate-500">Restaurante local</p>
-              <h1 className="text-xl font-black text-slate-900 sm:text-2xl">Ginita POS</h1>
-            </div>
-            <button
-              type="button"
-              onClick={() => setState((prev) => ({ ...prev, userRole: null }))}
-              className="inline-flex items-center gap-2 rounded-xl border border-slate-200 bg-white px-2.5 py-2 text-xs font-semibold text-slate-700 shadow-sm"
-            >
-              <LogOut size={14} />
-              Salir
-            </button>
+    <div className="min-h-screen bg-slate-50 flex flex-col font-sans text-slate-900 pb-16">
+      {/* Mobile Top App Bar */}
+      <header className="sticky top-0 z-20 h-14 bg-white/95 backdrop-blur-md border-b border-slate-200/90 px-4 flex items-center justify-between shadow-2xs">
+        <div className="flex items-center gap-2.5">
+          <div className="h-8 w-8 rounded-xl bg-slate-900 text-white flex items-center justify-center font-black text-xs shadow-2xs">
+            <Fish size={18} className="text-amber-400" />
           </div>
-
-          <div className="flex flex-wrap items-center gap-2">
-            <div className="rounded-xl border border-slate-200 bg-slate-50 px-2.5 py-2 text-[11px] font-semibold text-slate-700">
+          <div>
+            <h1 className="text-base font-black text-slate-900 leading-none tracking-tight">
+              Ginita POS
+            </h1>
+            <span className="text-[10px] text-slate-500 font-semibold tracking-wide">
               {getTodayLabel()}
-            </div>
-
-            {state.userRole !== 'cook' && (
-              <button
-                type="button"
-                onClick={() => setState((prev) => ({ ...prev, currentView: 'tables' }))}
-                className={`rounded-xl px-3 py-2 text-xs font-semibold transition ${
-                  state.currentView === 'tables' ? 'bg-slate-900 text-white' : 'bg-slate-100 text-slate-700'
-                }`}
-              >
-                Mesas
-              </button>
-            )}
-
-            {(state.userRole === 'cashier' || state.userRole === 'admin' || state.userRole === 'cook') && (
-              <button
-                type="button"
-                onClick={() => setState((prev) => ({ ...prev, currentView: 'kitchen' }))}
-                className={`rounded-xl px-3 py-2 text-xs font-semibold transition ${
-                  state.currentView === 'kitchen' ? 'bg-slate-900 text-white' : 'bg-slate-100 text-slate-700'
-                }`}
-              >
-                Cocina
-              </button>
-            )}
-
-            {(state.userRole === 'admin' || state.userRole === 'cashier') && (
-              <button
-                type="button"
-                onClick={() => setState((prev) => ({ ...prev, currentView: 'report' }))}
-                className={`rounded-xl px-3 py-2 text-xs font-semibold transition ${
-                  state.currentView === 'report' ? 'bg-slate-900 text-white' : 'bg-slate-100 text-slate-700'
-                }`}
-              >
-                Cierre día
-              </button>
-            )}
-
-            {state.userRole === 'admin' && (
-              <button
-                type="button"
-                onClick={() => setState((prev) => ({ ...prev, currentView: 'admin' }))}
-                className={`rounded-xl px-3 py-2 text-xs font-semibold transition ${
-                  state.currentView === 'admin' ? 'bg-slate-900 text-white' : 'bg-slate-100 text-slate-700'
-                }`}
-              >
-                Admin
-              </button>
-            )}
+            </span>
           </div>
+        </div>
+
+        {/* Role & Switch Button */}
+        <div className="flex items-center gap-2">
+          {/* Real-time Multi-device Sync / Connect button */}
+          <button
+            type="button"
+            onClick={() => setConnectModalOpen(true)}
+            className="flex items-center gap-1.5 px-2.5 py-1.5 rounded-xl text-[11px] font-bold border transition bg-emerald-50 text-emerald-800 border-emerald-200 hover:bg-emerald-100 active:scale-95 shadow-2xs"
+            title="Conectar varios celulares / Ver código QR"
+          >
+            <span className="w-2 h-2 rounded-full bg-emerald-500 animate-pulse" />
+            <Share2 size={13} className="text-emerald-700" />
+            <span className="hidden sm:inline">Conectar Celulares</span>
+            <span className="sm:hidden text-[10px]">Conectar</span>
+          </button>
+
+          <span className="hidden sm:inline-flex items-center gap-1 text-[11px] font-bold px-2.5 py-1 rounded-xl bg-slate-100 text-slate-700">
+            {state.userRole === 'cashier' ? (
+              <Users size={13} />
+            ) : state.userRole === 'cook' ? (
+              <ChefHat size={13} />
+            ) : (
+              <ShieldCheck size={13} />
+            )}
+            <span>
+              {state.userRole === 'cashier'
+                ? 'Mesero'
+                : state.userRole === 'cook'
+                  ? 'Cocinero'
+                  : 'Admin'}
+            </span>
+          </span>
+
+          <button
+            type="button"
+            onClick={() => setState((prev) => ({ ...prev, userRole: null }))}
+            className="min-h-[38px] px-2.5 rounded-xl border border-slate-200 bg-white text-slate-600 text-xs font-semibold hover:bg-slate-100 active:scale-95 transition flex items-center gap-1.5 shadow-2xs"
+            title="Cambiar perfil"
+          >
+            <LogOut size={14} />
+            <span className="text-[11px] font-bold">Cambiar</span>
+          </button>
         </div>
       </header>
 
-      <main className="mx-auto max-w-7xl px-3 py-4 sm:px-4">
-        {showKitchenView && !showAdminPanel && state.currentView !== 'report' ? (
-          <div className="space-y-4">
-            <div className="rounded-2xl bg-white p-4 shadow-sm ring-1 ring-slate-200">
-              <div className="flex items-center justify-between gap-4">
-                <div>
-                  <p className="text-[10px] font-semibold uppercase tracking-[0.2em] text-slate-500">Vista de cocina</p>
-                  <h2 className="text-xl font-black text-slate-900">Pedidos activos</h2>
-                </div>
-                <div className="rounded-xl bg-red-600 px-3 py-2 text-xs font-bold text-white">
-                  {kitchenQueue.length} pendientes
-                </div>
+      {/* Main Content View */}
+      <main className="flex-1 p-3.5 sm:p-5 max-w-5xl mx-auto w-full">
+        {state.currentView === 'tables' && (
+          <div className="space-y-3.5">
+            {/* Quick Filter Bar for Tables */}
+            <div className="flex items-center justify-between gap-2 overflow-x-auto pb-1 no-scrollbar">
+              <div className="flex items-center gap-1.5 p-1 rounded-2xl bg-slate-200/60">
+                <button
+                  type="button"
+                  onClick={() => setTableFilter('all')}
+                  className={`min-h-[36px] px-3 rounded-xl text-xs font-bold transition active:scale-95 ${
+                    tableFilter === 'all'
+                      ? 'bg-white text-slate-900 shadow-2xs'
+                      : 'text-slate-600 hover:text-slate-900'
+                  }`}
+                >
+                  Todas ({state.tables.length})
+                </button>
+                <button
+                  type="button"
+                  onClick={() => setTableFilter('interior')}
+                  className={`min-h-[36px] px-3 rounded-xl text-xs font-bold transition active:scale-95 ${
+                    tableFilter === 'interior'
+                      ? 'bg-white text-slate-900 shadow-2xs'
+                      : 'text-slate-600 hover:text-slate-900'
+                  }`}
+                >
+                  Interior (12)
+                </button>
+                <button
+                  type="button"
+                  onClick={() => setTableFilter('exterior')}
+                  className={`min-h-[36px] px-3 rounded-xl text-xs font-bold transition active:scale-95 ${
+                    tableFilter === 'exterior'
+                      ? 'bg-white text-slate-900 shadow-2xs'
+                      : 'text-slate-600 hover:text-slate-900'
+                  }`}
+                >
+                  Exterior (3)
+                </button>
+                <button
+                  type="button"
+                  onClick={() => setTableFilter('occupied')}
+                  className={`min-h-[36px] px-3 rounded-xl text-xs font-bold transition active:scale-95 ${
+                    tableFilter === 'occupied'
+                      ? 'bg-white text-amber-900 shadow-2xs'
+                      : 'text-slate-600 hover:text-slate-900'
+                  }`}
+                >
+                  Ocupadas (
+                    {
+                      state.tables.filter(
+                        (t) =>
+                          t.order &&
+                          Array.isArray(t.order.items) &&
+                          t.order.items.length > 0,
+                      ).length
+                    }
+                  )
+                </button>
               </div>
             </div>
 
-            <div className="grid gap-4">
-              {kitchenQueue.length === 0 ? (
-                <div className="rounded-2xl border border-dashed border-slate-300 bg-white p-8 text-center text-slate-500 shadow-sm">
-                  No hay órdenes pendientes.
-                </div>
-              ) : (
-                kitchenQueue.map(({ tableId, order, type }) => (
-                  <div key={tableId} className="rounded-2xl border border-slate-200 bg-white p-4 shadow-sm">
-                    <div className="mb-4 flex items-center justify-between gap-3">
-                      <div>
-                        <p className="text-[10px] font-semibold uppercase tracking-[0.2em] text-slate-500">{type}</p>
-                        <h3 className="text-lg font-black text-slate-900">{tableId}</h3>
-                      </div>
-                      <div className="flex items-center gap-2 rounded-xl bg-slate-100 px-2 py-1.5 text-xs font-medium text-slate-700">
-                        <Clock3 size={14} />
-                        {new Date(order.arrivedAt).toLocaleTimeString('es-EC', {
-                          hour: '2-digit',
-                          minute: '2-digit',
-                        })}
-                      </div>
-                    </div>
-
-                    <div className="space-y-2">
-                      {order.items.map((item) => (
-                        <div key={item.key} className="flex items-center justify-between rounded-xl bg-slate-50 px-3 py-2">
-                          <div>
-                            <p className="text-sm font-semibold text-slate-800">
-                              {item.qty}x {item.name}
-                              {item.cooking ? ` • ${item.cooking}` : ''}
-                            </p>
-                            <p className="text-[11px] text-slate-500">{item.category}</p>
-                          </div>
-                          <span className="text-sm font-bold text-slate-900">{formatCurrency(item.unitPrice * item.qty)}</span>
-                        </div>
-                      ))}
-                    </div>
-
-                    <button
-                      type="button"
-                      onClick={() => completeKitchenOrder(tableId)}
-                      className="mt-4 w-full rounded-xl bg-emerald-600 px-4 py-3 text-sm font-bold text-white transition active:scale-[0.99] hover:bg-emerald-500"
-                    >
-                      Despachar / Completado
-                    </button>
-                  </div>
-                ))
-              )}
-            </div>
-          </div>
-        ) : state.currentView === 'report' ? (
-          <div className="rounded-2xl border border-slate-200 bg-white p-4 shadow-sm">
-            <div className="mb-5 flex flex-wrap items-center justify-between gap-3">
-              <div>
-                <p className="text-[10px] font-semibold uppercase tracking-[0.2em] text-slate-500">Cierre del día</p>
-                <h2 className="text-xl font-black text-slate-900">Resumen financiero</h2>
-              </div>
-              <button
-                type="button"
-                onClick={resetDay}
-                className="rounded-xl border border-red-200 bg-red-50 px-3 py-2 text-sm font-semibold text-red-700 transition hover:bg-red-100"
-              >
-                Reiniciar ventas del día
-              </button>
-            </div>
-
-            <div className="grid gap-4 md:grid-cols-2 xl:grid-cols-5">
-              <div className="rounded-2xl bg-slate-900 p-4 text-white">
-                <p className="text-sm text-slate-300">Total recaudado</p>
-                <p className="mt-2 text-2xl font-black">{formatCurrency(todaysRevenue)}</p>
-              </div>
-              <div className="rounded-2xl bg-emerald-50 p-4 ring-1 ring-emerald-100">
-                <p className="text-sm text-emerald-700">Efectivo</p>
-                <p className="mt-2 text-xl font-black text-emerald-900">{formatCurrency(reportBreakdown.efectivo)}</p>
-              </div>
-              <div className="rounded-2xl bg-cyan-50 p-4 ring-1 ring-cyan-100">
-                <p className="text-sm text-cyan-700">Transferencia</p>
-                <p className="mt-2 text-xl font-black text-cyan-900">{formatCurrency(reportBreakdown.transferencia)}</p>
-              </div>
-              <div className="rounded-2xl bg-amber-50 p-4 ring-1 ring-amber-100">
-                <p className="text-sm text-amber-700">Pescados</p>
-                <p className="mt-2 text-xl font-black text-amber-900">{formatCurrency(reportBreakdown.Pescados)}</p>
-              </div>
-              <div className="rounded-2xl bg-violet-50 p-4 ring-1 ring-violet-100">
-                <p className="text-sm text-violet-700">Bebidas</p>
-                <p className="mt-2 text-xl font-black text-violet-900">{formatCurrency(reportBreakdown.Bebidas)}</p>
-              </div>
-            </div>
-          </div>
-        ) : showAdminPanel ? (
-          <div className="rounded-2xl border border-slate-200 bg-white p-4 shadow-sm">
-            <div className="mb-5 flex items-center justify-between gap-3">
-              <div>
-                <p className="text-[10px] font-semibold uppercase tracking-[0.2em] text-slate-500">Panel administrador</p>
-                <h2 className="text-xl font-black text-slate-900">Ajuste de precios</h2>
-              </div>
-            </div>
-
-            <div className="space-y-2">
-              {PRODUCT_CATALOG.map((product) => (
-                <div key={product.id} className="flex items-center justify-between gap-3 rounded-xl border border-slate-200 bg-slate-50 px-3 py-2">
-                  <div className="min-w-0 flex-1">
-                    <p className="truncate text-sm font-semibold text-slate-800">{product.name}</p>
-                    <p className="text-[11px] text-slate-500">{product.category}</p>
-                  </div>
-                  <input
-                    type="number"
-                    min="0"
-                    step="0.25"
-                    value={Number(state.basePrices[product.id] || 0)}
-                    onChange={(event) => {
-                      const value = Number(event.target.value)
-                      setState((prev) => ({
-                        ...prev,
-                        basePrices: {
-                          ...prev.basePrices,
-                          [product.id]: value,
-                        },
-                      }))
-                    }}
-                    className="w-24 rounded-xl border border-slate-200 bg-white px-2 py-2 text-right text-sm font-bold text-slate-900 outline-none focus:border-cyan-400"
-                  />
-                </div>
+            {/* Tables Touch Grid */}
+            <div className="grid grid-cols-2 sm:grid-cols-3 md:grid-cols-4 lg:grid-cols-5 gap-2.5">
+              {filteredTables.map((table) => (
+                <TableCard
+                  key={table.id}
+                  table={table}
+                  isSelected={state.selectedTableId === table.id}
+                  onClick={() => handleOpenTable(table.id)}
+                />
               ))}
             </div>
           </div>
-        ) : (
-          <div className="grid gap-5 xl:grid-cols-[1.7fr_1fr]">
-            <div className="rounded-2xl border border-slate-200 bg-white p-3 shadow-sm">
-              <div className="mb-4 flex items-center justify-between gap-3">
-                <div>
-                  <p className="text-[10px] font-semibold uppercase tracking-[0.2em] text-slate-500">Estado de mesas</p>
-                  <h2 className="text-xl font-black text-slate-900">Control operativo</h2>
-                </div>
-                <div className="flex flex-wrap items-center gap-2 text-[10px] text-slate-500">
-                  <span className="inline-flex items-center gap-1"><i className="h-2.5 w-2.5 rounded-full bg-emerald-500" />Libre</span>
-                  <span className="inline-flex items-center gap-1"><i className="h-2.5 w-2.5 rounded-full bg-red-500" />Ocupada</span>
-                  <span className="inline-flex items-center gap-1"><i className="h-2.5 w-2.5 rounded-full bg-orange-500" />Pendiente</span>
-                </div>
-              </div>
+        )}
 
-              <div className="grid gap-3 sm:grid-cols-2 xl:grid-cols-3 2xl:grid-cols-5">
-                {state.tables.map((table) => (
-                  <TableButton
-                    key={table.id}
-                    table={table}
-                    status={getTableStatus(table)}
-                    isActive={selectedTable?.id === table.id}
-                    onClick={() => openTable(table.id)}
-                  />
-                ))}
-              </div>
-            </div>
+        {state.currentView === 'kitchen' && (
+          <KitchenView
+            kitchenQueue={kitchenQueue}
+            onCompleteOrder={handleCompleteKitchenOrder}
+          />
+        )}
 
-            <aside className="rounded-2xl border border-slate-200 bg-white p-3 shadow-sm">
-              {selectedTable ? (
-                <>
-                  <div className="mb-4 flex items-center justify-between gap-3">
-                    <div>
-                      <p className="text-[10px] font-semibold uppercase tracking-[0.2em] text-slate-500">Pedido actual</p>
-                      <h3 className="text-xl font-black text-slate-900">{selectedTable.id}</h3>
-                    </div>
-                    <div className="rounded-xl bg-slate-100 px-2 py-1.5 text-[11px] font-semibold text-slate-700">
-                      {selectedTable.order?.paid ? 'Cobrado' : selectedTable.order?.pendingPayment ? 'Pendiente' : 'Abierto'}
-                    </div>
-                  </div>
+        {state.currentView === 'report' && (
+          <ReportView
+            dailySales={state.dailySales}
+            onResetDay={handleResetDay}
+          />
+        )}
 
-                  <div className="mb-4 flex flex-wrap gap-2">
-                    {COOKING_MODES.map((mode) => (
-                      <button
-                        key={mode}
-                        type="button"
-                        onClick={() => setSelectedCooking(mode)}
-                        className={`rounded-xl px-3 py-2 text-xs font-bold transition ${
-                          selectedCooking === mode ? 'bg-cyan-600 text-white' : 'bg-slate-100 text-slate-700'
-                        }`}
-                      >
-                        {mode === 'frito' ? 'Frito' : 'Al vapor'}
-                      </button>
-                    ))}
-                  </div>
-
-                  <div className="mt-4">
-                    <button
-                      type="button"
-                      onClick={() => setShowProductPicker(true)}
-                      className="w-full rounded-2xl bg-cyan-600 px-4 py-3 text-sm font-black text-white transition active:scale-[0.99] hover:bg-cyan-500"
-                    >
-                      Agregar producto
-                    </button>
-                  </div>
-
-                  <div className="mt-4 rounded-2xl bg-slate-100 p-3">
-                    <div className="mb-2 flex items-center justify-between text-xs font-semibold text-slate-600">
-                      <span>Acciones rápidas</span>
-                      <span>Empanadas</span>
-                    </div>
-                    <div className="grid grid-cols-3 gap-2">
-                      {QUICK_ITEMS.map((item) => (
-                        <button
-                          key={item.key}
-                          type="button"
-                          onClick={() => addProductToOrder('empanada', item.qty)}
-                          className="rounded-xl bg-white px-2 py-2 text-xs font-bold text-slate-700"
-                        >
-                          {item.label}
-                        </button>
-                      ))}
-                    </div>
-                  </div>
-
-                  <div className="mt-4 rounded-2xl border border-slate-200 bg-slate-50 p-3">
-                    <div className="mb-3 flex items-center justify-between gap-2">
-                      <h4 className="text-base font-black text-slate-900">Detalle</h4>
-                      <div className="rounded-xl bg-white px-2 py-1 text-[11px] font-bold text-slate-700">
-                        {selectedTable.order?.items.length || 0} items
-                      </div>
-                    </div>
-
-                    <div className="space-y-2">
-                      {selectedTable.order?.items.length ? (
-                        selectedTable.order.items.map((item) => (
-                          <div key={item.key} className="rounded-xl bg-white p-2">
-                            <div className="flex items-center justify-between gap-2">
-                              <span className="text-sm font-semibold text-slate-800">
-                                {item.name}
-                                {item.cooking ? ` (${item.cooking})` : ''}
-                              </span>
-                              <span className="text-sm font-black text-slate-900">{formatCurrency(item.unitPrice * item.qty)}</span>
-                            </div>
-                            <div className="mt-2 flex items-center justify-between">
-                              <div className="flex items-center gap-2">
-                                <button type="button" onClick={() => updateItemQty(item.key, -1)} className="h-7 w-7 rounded-lg bg-slate-200 font-black text-slate-800">-</button>
-                                <span className="min-w-7 text-center text-sm font-bold text-slate-900">{item.qty}</span>
-                                <button type="button" onClick={() => updateItemQty(item.key, 1)} className="h-7 w-7 rounded-lg bg-slate-900 font-black text-white">+</button>
-                              </div>
-                              <button type="button" onClick={() => removeItem(item.key)} className="text-[10px] font-bold uppercase tracking-wide text-red-600">Eliminar</button>
-                            </div>
-                          </div>
-                        ))
-                      ) : (
-                        <p className="py-4 text-center text-sm text-slate-500">Todavía no hay productos en la mesa.</p>
-                      )}
-                    </div>
-
-                    <div className="mt-4 rounded-xl bg-slate-900 p-3 text-white">
-                      <div className="flex items-center justify-between gap-2">
-                        <span className="text-xs text-slate-300">Total</span>
-                        <span className="text-xl font-black">{formatCurrency(currentOrderTotal)}</span>
-                      </div>
-                    </div>
-
-                    <div className="mt-4 grid gap-2">
-                      {!selectedTable.order?.paid && selectedTable.order && selectedTable.order.items.length > 0 && (
-                        <button
-                          type="button"
-                          onClick={sendToKitchen}
-                          className="rounded-xl bg-red-600 px-4 py-3 text-sm font-black text-white transition active:scale-[0.99] hover:bg-red-500"
-                        >
-                          Enviar a Cocina
-                        </button>
-                      )}
-
-                      {(selectedTable.order?.sentToKitchen || selectedTable.order?.pendingPayment) && !selectedTable.order?.paid && (
-                        <button
-                          type="button"
-                          onClick={() => openPayment(selectedTable.id)}
-                          className="rounded-xl bg-emerald-600 px-4 py-3 text-sm font-black text-white transition active:scale-[0.99] hover:bg-emerald-500"
-                        >
-                          Cobrar
-                        </button>
-                      )}
-
-                      {selectedTable.order?.paid && (
-                        <button
-                          type="button"
-                          onClick={() => releaseTable(selectedTable.id)}
-                          className="rounded-xl border border-slate-300 bg-white px-4 py-3 text-sm font-black text-slate-700 transition hover:bg-slate-100"
-                        >
-                          Desocupar mesa
-                        </button>
-                      )}
-                    </div>
-                  </div>
-                </>
-              ) : (
-                <div className="flex min-h-[200px] items-center justify-center rounded-2xl border border-dashed border-slate-300 bg-slate-50 p-4 text-center text-slate-500">
-                  Selecciona una mesa para abrir el pedido.
-                </div>
-              )}
-            </aside>
-          </div>
+        {state.currentView === 'admin' && (
+          <AdminPricesView
+            basePrices={state.basePrices}
+            onUpdatePrice={handleUpdatePrice}
+          />
         )}
       </main>
 
-      {showProductPicker && selectedTable && (
-        <div className="fixed inset-0 z-40 flex items-center justify-center bg-slate-950/70 p-4">
-          <div className="flex h-full max-h-[85vh] w-full max-w-3xl flex-col overflow-hidden rounded-3xl bg-white shadow-2xl">
-            <div className="flex items-center justify-between border-b border-slate-200 px-4 py-3">
-              <div>
-                <p className="text-[10px] font-semibold uppercase tracking-[0.2em] text-slate-500">Catálogo</p>
-                <h3 className="text-lg font-black text-slate-900">Agregar producto a {selectedTable.id}</h3>
-              </div>
-              <button type="button" onClick={() => setShowProductPicker(false)} className="rounded-xl bg-slate-100 px-3 py-2 text-sm font-bold text-slate-700">Listo</button>
-            </div>
-
-            <div className="grid gap-2 overflow-y-auto p-3 sm:grid-cols-2">
-              {PRODUCT_CATALOG.map((product) => (
-                <button
-                  key={product.id}
-                  type="button"
-                  onClick={() => addProductToOrder(product.id, 1)}
-                  className="flex items-center justify-between rounded-2xl border border-slate-200 bg-slate-50 px-3 py-3 text-left transition hover:border-cyan-300 hover:bg-cyan-50"
-                >
-                  <div>
-                    <div className="text-sm font-bold text-slate-900">{product.name}</div>
-                    <div className="text-[11px] text-slate-500">{product.category}</div>
-                  </div>
-                  <div className="text-sm font-black text-slate-900">{formatCurrency(productPrices[product.id])}</div>
-                </button>
-              ))}
-            </div>
-          </div>
-        </div>
+      {/* Floating Bottom Sheet Menu for Waiter when Table is tapped */}
+      {selectedTable && (
+        <TableOrderDrawer
+          table={selectedTable}
+          basePrices={state.basePrices}
+          onClose={handleCloseDrawer}
+          onAddProduct={handleAddProduct}
+          onOpenCookingModal={(product) =>
+            setFishCookingSelection({ isOpen: true, product })
+          }
+          onOpenPortionModal={() => setPortionModalOpen(true)}
+          onOpenEmpanadaModal={() => setEmpanadaModalOpen(true)}
+          onOpenAlmejasModal={() => setAlmejasModalOpen(true)}
+          onUpdateQty={handleUpdateQty}
+          onRemoveItem={handleRemoveItem}
+          onSendToKitchen={handleSendToKitchen}
+          onOpenPayment={handleOpenPayment}
+          onReleaseTable={handleReleaseTable}
+        />
       )}
 
-      {paymentSelection.open && (
-        <div className="fixed inset-0 z-50 flex items-end justify-center bg-slate-900/70 p-3">
-          <div className="w-full max-w-md rounded-t-3xl bg-white p-4 shadow-2xl">
-            {!paymentSelection.method ? (
-              <>
-                <div className="mb-4 flex items-center justify-between gap-3">
-                  <div>
-                    <p className="text-[10px] font-semibold uppercase tracking-[0.2em] text-slate-500">Cobro</p>
-                    <h3 className="text-xl font-black text-slate-900">Total: {formatCurrency(paymentSelection.total)}</h3>
-                  </div>
-                  <button type="button" onClick={() => setPaymentSelection({ open: false, tableId: null, total: 0, method: null })} className="text-sm font-bold text-slate-500">Cerrar</button>
-                </div>
+      {/* 1. Floating Modal for Fish Cooking selection (Frito vs Al vapor + Para Llevar + Notas) */}
+      <FishCookingModal
+        isOpen={fishCookingSelection.isOpen}
+        product={fishCookingSelection.product}
+        onConfirm={handleConfirmCooking}
+        onClose={() => setFishCookingSelection({ isOpen: false, product: null })}
+      />
 
-                <div className="grid gap-3">
-                  <button
-                    type="button"
-                    onClick={() => {
-                      finalizePayment(paymentSelection.tableId, 'efectivo')
-                      closePayment()
-                    }}
-                    className="flex items-center justify-center gap-2 rounded-2xl bg-emerald-600 px-4 py-4 text-base font-black text-white"
-                  >
-                    <CreditCard size={18} />
-                    Efectivo
-                  </button>
+      {/* 2. Floating Modal for Extra Portions (Papa, Tostado, Curtido) */}
+      <PortionModal
+        isOpen={portionModalOpen}
+        basePrices={state.basePrices}
+        onConfirm={handleConfirmPortion}
+        onClose={() => setPortionModalOpen(false)}
+      />
 
-                  <button
-                    type="button"
-                    onClick={() => setPaymentSelection((prev) => ({ ...prev, method: 'transferencia' }))}
-                    className="flex items-center justify-center gap-2 rounded-2xl bg-sky-600 px-4 py-4 text-base font-black text-white"
-                  >
-                    <CreditCard size={18} />
-                    Transferencia
-                  </button>
-                </div>
-              </>
-            ) : (
-              <>
-                <div className="mb-4 flex items-center justify-between gap-3">
-                  <div>
-                    <p className="text-[10px] font-semibold uppercase tracking-[0.2em] text-slate-500">Transferencia</p>
-                    <h3 className="text-base font-black text-slate-900">Cuenta de ahorros Yolanda Morales  14158468</h3>
-                  </div>
-                  <button type="button" onClick={() => setPaymentSelection({ open: false, tableId: null, total: 0, method: null })} className="text-sm font-bold text-slate-500">Cerrar</button>
-                </div>
+      {/* 3. Floating Modal for Fast Empanada Quantities (+1, +4, +8, +12) */}
+      <EmpanadaModal
+        isOpen={empanadaModalOpen}
+        unitPrice={getProductPrice('empanada', state.basePrices)}
+        onConfirm={handleConfirmEmpanada}
+        onClose={() => setEmpanadaModalOpen(false)}
+      />
 
-                <div className="mb-4 rounded-2xl border border-slate-200 bg-slate-50 p-3">
-                  <img src="/qr.png" alt="Código QR para transferencia" className="mx-auto h-56 w-56 rounded-xl object-cover" />
-                </div>
+      {/* 4. Floating Modal for Almejas with Takeout and Notes */}
+      <AlmejasModal
+        isOpen={almejasModalOpen}
+        unitPrice={getProductPrice('almejas', state.basePrices)}
+        onConfirm={handleConfirmAlmejas}
+        onClose={() => setAlmejasModalOpen(false)}
+      />
 
-                <button
-                  type="button"
-                  onClick={() => {
-                    finalizePayment(paymentSelection.tableId, 'transferencia')
-                    closePayment()
-                  }}
-                  className="w-full rounded-2xl bg-sky-600 px-4 py-3 text-base font-black text-white"
-                >
-                  Confirmar pago por transferencia
-                </button>
-              </>
-            )}
-          </div>
-        </div>
-      )}
+      {/* 5. Payment Modal */}
+      <PaymentModal
+        isOpen={paymentSelection.isOpen}
+        tableId={paymentSelection.tableId}
+        total={paymentSelection.total}
+        onConfirmPayment={handleConfirmPayment}
+        onClose={() =>
+          setPaymentSelection({ isOpen: false, tableId: null, total: 0 })
+        }
+      />
+
+      {/* 6. Multi-Device Connect & QR Code Modal */}
+      <ConnectDevicesModal
+        isOpen={connectModalOpen}
+        onClose={() => setConnectModalOpen(false)}
+        dbStatus={dbStatus}
+      />
+
+      {/* Fixed Bottom Navigation Bar for Mobile Thumb Ergonomics */}
+      <BottomNavBar
+        currentView={state.currentView}
+        onSelectView={(view) =>
+          setState((prev) => ({ ...prev, currentView: view }))
+        }
+        userRole={state.userRole}
+        kitchenQueueCount={kitchenQueue.length}
+      />
     </div>
   )
 }
-
-export default App

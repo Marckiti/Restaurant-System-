@@ -1,9 +1,10 @@
 import express from 'express'
 import http from 'node:http'
-import { mkdirSync, readFileSync, writeFileSync } from 'node:fs'
-import { join } from 'node:path'
+import { existsSync } from 'node:fs'
+import { dirname, join } from 'node:path'
+import { fileURLToPath } from 'node:url'
 import { Server } from 'socket.io'
-import { buildDefaultState } from './src/logic.js'
+import { getSharedState, updateSharedState, getDbStatus } from './src/db-sync.js'
 
 const app = express()
 const server = http.createServer(app)
@@ -14,66 +15,77 @@ const io = new Server(server, {
   },
 })
 
-const DATA_DIR = join(globalThis.process?.cwd?.() || '.', 'data')
-const DATA_PATH = join(DATA_DIR, 'shared-state.json')
+app.use(express.json())
 
-mkdirSync(DATA_DIR, { recursive: true })
+app.get('/api/status', (_, res) => {
+  res.json(getDbStatus())
+})
 
-const readSharedState = () => {
+app.get('/api/state', async (_, res) => {
   try {
-    const raw = readFileSync(DATA_PATH, 'utf8')
-    if (!raw.trim()) return buildDefaultState()
-    const parsed = JSON.parse(raw)
-    return {
-      ...buildDefaultState(),
-      ...parsed,
-      tables: Array.isArray(parsed.tables) ? parsed.tables : buildDefaultState().tables,
-      dailySales: Array.isArray(parsed.dailySales) ? parsed.dailySales : [],
-      basePrices: parsed.basePrices ? { ...buildDefaultState().basePrices, ...parsed.basePrices } : buildDefaultState().basePrices,
-    }
-  } catch {
-    return buildDefaultState()
+    const state = await getSharedState()
+    res.json(state)
+  } catch (err) {
+    res.status(500).json({ error: err.message })
   }
-}
-
-let sharedState = readSharedState()
-
-const persistSharedState = () => {
-  writeFileSync(DATA_PATH, JSON.stringify(sharedState, null, 2), 'utf8')
-}
-
-app.get('/health', (_, res) => {
-  res.json({ ok: true, tables: sharedState.tables.length, sales: sharedState.dailySales.length })
 })
 
-function broadcastState() {
-  io.emit('state:update', sharedState)
+app.post('/api/state', async (req, res) => {
+  try {
+    const saved = await updateSharedState(req.body)
+    io.emit('state:update', saved)
+    res.json({ ok: true, savedAt: saved.updatedAt })
+  } catch (err) {
+    res.status(400).json({ error: err.message })
+  }
+})
+
+app.get('/health', async (_, res) => {
+  const state = await getSharedState()
+  res.json({
+    ok: true,
+    tables: state.tables?.length || 0,
+    sales: state.dailySales?.length || 0,
+    db: getDbStatus(),
+  })
+})
+
+function broadcastState(state) {
+  io.emit('state:update', state)
 }
 
-io.on('connection', (socket) => {
-  socket.emit('state:update', sharedState)
+io.on('connection', async (socket) => {
+  const current = await getSharedState()
+  socket.emit('state:update', current)
 
-  socket.on('state:request', () => {
-    socket.emit('state:update', sharedState)
+  socket.on('state:request', async () => {
+    const state = await getSharedState()
+    socket.emit('state:update', state)
   })
 
-  socket.on('state:update', (incoming) => {
+  socket.on('state:update', async (incoming) => {
     if (!incoming || typeof incoming !== 'object') return
-    sharedState = {
-      ...buildDefaultState(),
-      ...incoming,
-      tables: Array.isArray(incoming.tables) ? incoming.tables : sharedState.tables,
-      dailySales: Array.isArray(incoming.dailySales) ? incoming.dailySales : sharedState.dailySales,
-      basePrices: incoming.basePrices ? { ...buildDefaultState().basePrices, ...incoming.basePrices } : sharedState.basePrices,
-    }
-    persistSharedState()
-    broadcastState()
+    const updated = await updateSharedState(incoming)
+    broadcastState(updated)
   })
 })
 
-const PORT = Number(globalThis.process?.env?.PORT || 3001)
+const __dirname = dirname(fileURLToPath(import.meta.url))
+const DIST_DIR = join(__dirname, 'dist')
+
+if (existsSync(DIST_DIR)) {
+  app.use(express.static(DIST_DIR))
+  app.get('*', (req, res, next) => {
+    if (req.path.startsWith('/socket.io') || req.path.startsWith('/api/') || req.path === '/health') {
+      return next()
+    }
+    res.sendFile(join(DIST_DIR, 'index.html'))
+  })
+}
+
+const PORT = Number(globalThis.process?.env?.PORT || 3000)
 const HOST = '0.0.0.0'
 
 server.listen(PORT, HOST, () => {
-  console.log(`Ginita POS sync server running on http://${HOST}:${PORT}`)
+  console.log(`Ginita POS server running on http://${HOST}:${PORT}`)
 })

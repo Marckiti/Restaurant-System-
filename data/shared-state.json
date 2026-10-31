@@ -1,0 +1,106 @@
+{
+  "userRole": null,
+  "selectedTableId": null,
+  "currentView": "tables",
+  "tables": [
+    {
+      "id": "Mesa 1",
+      "type": "Interior",
+      "order": null
+    },
+    {
+      "id": "Mesa 2",
+      "type": "Interior",
+      "order": null
+    },
+    {
+      "id": "Mesa 3",
+      "type": "Interior",
+      "order": null
+    },
+    {
+      "id": "Mesa 4",
+      "type": "Interior",
+      "order": null
+    },
+    {
+      "id": "Mesa 5",
+      "type": "Interior",
+      "order": null
+    },
+    {
+      "id": "Mesa 6",
+      "type": "Interior",
+      "order": null
+    },
+    {
+      "id": "Mesa 7",
+      "type": "Interior",
+      "order": null
+    },
+    {
+      "id": "Mesa 8",
+      "type": "Interior",
+      "order": null
+    },
+    {
+      "id": "Mesa 9",
+      "type": "Interior",
+      "order": null
+    },
+    {
+      "id": "Mesa 10",
+      "type": "Interior",
+      "order": null
+    },
+    {
+      "id": "Mesa 11",
+      "type": "Interior",
+      "order": null
+    },
+    {
+      "id": "Mesa 12",
+      "type": "Interior",
+      "order": null
+    },
+    {
+      "id": "Exterior 1",
+      "type": "Exterior",
+      "order": null
+    },
+    {
+      "id": "Exterior 2",
+      "type": "Exterior",
+      "order": null
+    },
+    {
+      "id": "Exterior 3",
+      "type": "Exterior",
+      "order": null
+    }
+  ],
+  "basePrices": {
+    "pescado-grande": 5,
+    "pescado-pequeno": 4.5,
+    "almejas": 1.5,
+    "porciones": 1,
+    "porcion-papa": 1,
+    "porcion-tostado": 0.5,
+    "porcion-curtido": 0.5,
+    "combo-morocho": 1.75,
+    "morocho": 1.25,
+    "combo-colada": 1.75,
+    "vaso-colada": 1.25,
+    "empanada": 0.25,
+    "limonada-jarra": 2,
+    "limonada-media": 1,
+    "cola-personal": 0.5,
+    "cola-litro": 2,
+    "cola-3lt": 4,
+    "agua": 0.5,
+    "agua-gas": 0.75,
+    "cerveza": 3.75
+  },
+  "dailySales": [],
+  "updatedAt": 1793464474353
+}
